@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MapReduce Word Count</title>
+<style>
+:root {
+  --bg: #fafaf7; --card: #ffffff; --ink: #1c1c1a; --muted: #62625c; --line: #e0e0d8;
+  --r0: #1a56b8; --r0bg: #e3eefc; --r1: #9a4208; --r1bg: #fbe9dc; --hit: #d99a00;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141413; --card: #1e1e1c; --ink: #ecece6; --muted: #a0a099; --line: #34342f;
+    --r0: #7db0ff; --r0bg: #16294a; --r1: #f2a76e; --r1bg: #3d2514; --hit: #ffc83d;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 24px; margin: 0 0 4px; }
+h2 { font-size: 18px; margin: 20px 0 4px; }
+.sub, .desc, .note { color: var(--muted); margin: 0; }
+.steps { display: flex; flex-wrap: wrap; gap: 6px; margin: 16px 0 8px; }
+button { font: inherit; padding: 6px 12px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--card); color: var(--ink); cursor: pointer; }
+button:disabled { opacity: .4; cursor: default; }
+.step.on { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.bar label { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+input { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--card); color: var(--ink); width: 160px; }
+.trace { min-height: 1.5em; margin: 8px 0 0; font-weight: 600; }
+#stage { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-top: 12px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.card header { display: flex; justify-content: space-between; gap: 8px; padding: 10px 12px;
+  border-bottom: 1px solid var(--line); }
+.rc0 header { border-top: 4px solid var(--r0); }
+.rc1 header { border-top: 4px solid var(--r1); }
+.body { padding: 8px 10px; }
+.body.scroll { max-height: 460px; overflow: auto; padding: 0; }
+.body.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+pre { margin: 0; white-space: pre-wrap; font: 13px/1.6 ui-monospace, Menlo, monospace; }
+.chip { display: inline-block; margin: 2px; padding: 1px 8px; border-radius: 999px;
+  border: 1px solid var(--line); font: 12px/1.7 ui-monospace, Menlo, monospace; }
+.colhead { font-weight: 600; font-size: 13px; padding: 2px 8px; border-radius: 6px; margin-bottom: 4px; }
+.r0 { background: var(--r0bg); color: var(--r0); border-color: var(--r0); }
+.r1 { background: var(--r1bg); color: var(--r1); border-color: var(--r1); }
+.row { display: flex; justify-content: space-between; gap: 12px; padding: 4px 12px;
+  border-bottom: 1px solid var(--line); font: 13px ui-monospace, Menlo, monospace; }
+.dim { opacity: .2; }
+.hit { opacity: 1; outline: 2px solid var(--hit); outline-offset: 1px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>MapReduce word count</h1>
+  <p class="sub">Real data from countingWords.py: <span id="meta"></span></p>
+
+  <div id="steps" class="steps"></div>
+  <div class="bar">
+    <button id="prev">&larr; Back</button>
+    <button id="next">Next &rarr;</button>
+    <label>Follow a word <input id="q" placeholder="students" autocomplete="off"></label>
+  </div>
+  <p id="trace" class="trace"></p>
+
+  <h2 id="title"></h2>
+  <p id="desc" class="desc"></p>
+  <div id="stage"></div>
+</main>
+
+<script src="visualize-data.js"></script>
+<script>
+const STAGES = [
+  ["Input", "Each file is one split. Nothing is counted yet."],
+  ["Map", "Each file gets its own mapper process (5 files = 5 processes, all started together). Every word becomes a (word, 1) pair."],
+  ["Combine", "Inside each mapper, the 1s are added up, so each word has one subtotal."],
+  ["Partition", "partition(word) sends each word to reducer 0 or 1. The same word always goes to the same reducer."],
+  ["Shuffle & sort", "Each reducer gathers its words from all the mappers, groups the subtotals by word and sorts the words."],
+  ["Reduce", "Each reducer adds up the subtotals of every word and writes one output file."],
+];
+
+const $ = id => document.getElementById(id);
+const has = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);
+
+// which reducer each word ended up in
+const reducerOf = Object.create(null);
+DATA.reducers.forEach((rows, r) => rows.forEach(row => { reducerOf[row.word] = r; }));
+
+let stage = 0;
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function chip(word, label, r) {
+  const c = el("span", "chip" + (r === undefined ? "" : " r" + r), label);
+  c.dataset.word = word;
+  return c;
+}
+
+function card(title, note) {
+  const c = el("section", "card");
+  const h = el("header");
+  h.append(el("b", null, title), el("span", "note", note));
+  const body = el("div", "body");
+  c.append(h, body);
+  return [c, body];
+}
+
+function renderInput(box) {
+  DATA.files.forEach(f => {
+    const [c, body] = card(f.name, f.pairs.length + " words");
+    body.append(el("pre", null, f.text));
+    box.append(c);
+  });
+}
+
+function renderMap(box) {
+  DATA.files.forEach((f, i) => {
+    const [c, body] = card("Mapper " + i + " · " + f.name, f.pairs.length + " pairs");
+    f.pairs.forEach(w => body.append(chip(w, "(" + w + ", 1)")));
+    box.append(c);
+  });
+}
+
+function renderCombine(box) {
+  DATA.files.forEach((f, i) => {
+    const words = Object.keys(f.totals);
+    const [c, body] = card("Mapper " + i + " · " + f.name, f.pairs.length + " pairs → " + words.length + " subtotals");
+    words.forEach(w => body.append(chip(w, w + " ×" + f.totals[w])));
+    box.append(c);
+  });
+}
+
+function renderPartition(box) {
+  DATA.files.forEach((f, i) => {
+    const words = Object.keys(f.totals);
+    const [c, body] = card("Mapper " + i + " · " + f.name, "sent to each reducer");
+    body.classList.add("cols");
+    DATA.reducers.forEach((rows, r) => {
+      const col = el("div");
+      const mine = words.filter(w => reducerOf[w] === r);
+      col.append(el("div", "colhead r" + r, "Reducer " + r + " · " + mine.length));
+      mine.forEach(w => col.append(chip(w, w + " ×" + f.totals[w], r)));
+      body.append(col);
+    });
+    box.append(c);
+  });
+}
+
+function renderReducers(box, reduced) {
+  DATA.reducers.forEach((rows, r) => {
+    const note = reduced ? "→ PartReducer-" + (r + 1) + ".txt" : rows.length + " words, sorted";
+    const [c, body] = card("Reducer " + r, note);
+    c.classList.add("rc" + r);
+    body.classList.add("scroll");
+    rows.forEach(row => {
+      const line = el("div", "row");
+      line.dataset.word = row.word;
+      const values = "[" + row.values.join(", ") + "]";
+      line.append(el("span", null, row.word), el("span", null, reduced ? values + " → " + row.total : values));
+      body.append(line);
+    });
+    box.append(c);
+  });
+}
+
+const RENDER = [
+  renderInput, renderMap, renderCombine, renderPartition,
+  box => renderReducers(box, false), box => renderReducers(box, true),
+];
+
+// highlight one word everywhere and explain where it went
+function follow() {
+  const q = $("q").value.trim().toLowerCase();
+  const known = q in reducerOf;
+  document.querySelectorAll("[data-word]").forEach(n => {
+    n.classList.toggle("hit", known && n.dataset.word === q);
+    n.classList.toggle("dim", known && n.dataset.word !== q);
+  });
+  const first = document.querySelector(".row.hit");
+  if (first) first.scrollIntoView({ block: "nearest" });
+
+  const trace = $("trace");
+  if (!q) {
+    trace.textContent = "";
+  } else if (!known) {
+    trace.textContent = "“" + q + "” is not in these files.";
+  } else {
+    const r = reducerOf[q];
+    const row = DATA.reducers[r].find(x => x.word === q);
+    const where = DATA.files.filter(f => has(f.totals, q)).map(f => f.name + " ×" + f.totals[q]).join(", ");
+    trace.textContent = q + ": " + where + " → reducer " + r + " gets [" + row.values.join(", ") + "] → total " + row.total;
+  }
+}
+
+function show(n) {
+  stage = Math.max(0, Math.min(STAGES.length - 1, n));
+  $("title").textContent = (stage + 1) + ". " + STAGES[stage][0];
+  $("desc").textContent = STAGES[stage][1];
+  const box = $("stage");
+  box.replaceChildren();
+  RENDER[stage](box);
+  [...$("steps").children].forEach((b, i) => b.classList.toggle("on", i === stage));
+  $("prev").disabled = stage === 0;
+  $("next").disabled = stage === STAGES.length - 1;
+  follow();
+}
+
+STAGES.forEach((s, i) => {
+  const b = el("button", "step", (i + 1) + " " + s[0]);
+  b.onclick = () => show(i);
+  $("steps").append(b);
+});
+$("prev").onclick = () => show(stage - 1);
+$("next").onclick = () => show(stage + 1);
+$("q").oninput = follow;
+
+const totalWords = DATA.files.reduce((sum, f) => sum + f.pairs.length, 0);
+$("meta").textContent = DATA.files.length + " files, " + totalWords + " words, " + DATA.reducers.length + " reducers";
+
+// open a given step and word from the link, like visualize.html#s=3&w=students
+const link = new URLSearchParams(location.hash.slice(1));
+$("q").value = link.get("w") || "";
+show(Number(link.get("s")) || 0);
+</script>
+</body>
+</html>
